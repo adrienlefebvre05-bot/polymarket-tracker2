@@ -1,8 +1,11 @@
+# Save this file to: .github/workflows/polymarket-sync.yml in your repo
+
 name: Sync Polymarket sports volume
 
 on:
   schedule:
-    - cron: "0 6 * * *"
+    # Runs daily at 04:00 UTC/GMT, so it's ready when you log in.
+    - cron: "0 4 * * *"
   workflow_dispatch: {}
 
 jobs:
