@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Sports Volume Tape</title>
+<title>Biggest open sports bets</title>
 <style>
   * { box-sizing: border-box; }
   body {
@@ -23,25 +23,25 @@
   }
   .chip.active { background: #E7ECF0; color: #0A0D11; }
   .card { background: #12171D; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+  .rank { font-size: 11px; color: #5C6773; margin-bottom: 4px; }
   .card-top { display: flex; justify-content: space-between; gap: 8px; align-items: flex-start; }
   .title { font-size: 13px; line-height: 1.4; flex: 1; }
   .sport-badge {
     font-size: 10px; background: #171D25; color: #8FAAD9; padding: 3px 8px;
     border-radius: 4px; flex-shrink: 0; white-space: nowrap;
   }
-  .card-bottom { display: flex; justify-content: space-between; margin-top: 6px; font-size: 13px; }
-  .vol { font-weight: 600; }
-  .vol-label { color: #5C6773; font-weight: 400; }
-  .delta-up { color: #2FD675; }
-  .delta-down { color: #FF5C5C; }
-  .delta-new { color: #FFB020; }
-  .delta-none { color: #3A424C; }
+  .card-bottom { display: flex; justify-content: space-between; align-items: baseline; margin-top: 6px; font-size: 13px; }
+  .value { font-weight: 600; font-size: 15px; }
+  .meta { color: #5C6773; font-size: 12px; }
+  .wallet { font-family: monospace; color: #8FAAD9; }
+  .outcome-yes { color: #2FD675; }
+  .outcome-no { color: #FF5C5C; }
   .error { color: #FF8A5C; background: #1A1210; border: 1px solid #4A2A20; padding: 12px; border-radius: 8px; font-size: 13px; }
 </style>
 </head>
 <body>
-  <h1>Sports Volume Tape</h1>
-  <p class="sub">Polymarket sports markets ranked by 24h volume, synced daily via GitHub Action</p>
+  <h1>Biggest open sports bets</h1>
+  <p class="sub">Largest wallet positions still open on Polymarket sports markets, synced daily</p>
   <div id="status" class="status">Loading…</div>
   <div id="chips" class="chips"></div>
   <div id="list"></div>
@@ -56,9 +56,12 @@ function fmtUSD(n) {
   return "$" + Math.round(n);
 }
 
-let currentRows = [];
-let prevMap = {};
-let prevDate = null;
+function shortWallet(w) {
+  if (!w) return "unknown";
+  return w.slice(0, 6) + "…" + w.slice(-4);
+}
+
+let allBets = [];
 let sportFilter = "All";
 
 function render() {
@@ -66,7 +69,7 @@ function render() {
   const listEl = document.getElementById("list");
   const statusEl = document.getElementById("status");
 
-  const sports = ["All", ...new Set(currentRows.map((r) => r.sport))].sort((a, b) =>
+  const sports = ["All", ...new Set(allBets.map((r) => r.sport))].sort((a, b) =>
     a === "All" ? -1 : a.localeCompare(b)
   );
   chipsEl.innerHTML = sports
@@ -82,48 +85,39 @@ function render() {
     });
   });
 
-  const filtered = currentRows.filter((r) => sportFilter === "All" || r.sport === sportFilter);
-  statusEl.textContent =
-    filtered.length + " markets" + (prevDate ? " · vs " + prevDate : " · first day, no comparison yet");
+  const filtered = allBets.filter((r) => sportFilter === "All" || r.sport === sportFilter);
+  statusEl.textContent = filtered.length + " open positions" + (filtered[0] ? " · latest snapshot " + filtered[0].snapshot_date : "");
 
   listEl.innerHTML =
     filtered
       .slice(0, 50)
-      .map((r) => {
-        const prev = prevMap[r.slug];
-        const delta = prev ? r.volume_24hr - prev.volume_24hr : null;
-        let deltaHtml;
-        if (!prevDate) deltaHtml = '<span class="delta-none">—</span>';
-        else if (!prev) deltaHtml = '<span class="delta-new">new</span>';
-        else if (delta >= 0) deltaHtml = '<span class="delta-up">▲ ' + fmtUSD(delta) + "</span>";
-        else deltaHtml = '<span class="delta-down">▼ ' + fmtUSD(Math.abs(delta)) + "</span>";
-
+      .map((r, i) => {
+        const outcomeClass = /yes/i.test(r.outcome) ? "outcome-yes" : /no/i.test(r.outcome) ? "outcome-no" : "";
         return (
-          '<div class="card"><div class="card-top"><span class="title">' +
-          r.title +
+          '<div class="card"><div class="rank">#' +
+          (i + 1) +
+          '</div><div class="card-top"><span class="title">' +
+          r.market_title +
           '</span><span class="sport-badge">' +
           r.sport +
-          '</span></div><div class="card-bottom"><span class="vol">' +
-          fmtUSD(r.volume_24hr) +
-          ' <span class="vol-label">24h</span></span><span>' +
-          deltaHtml +
+          '</span></div><div class="card-bottom"><span class="value">' +
+          fmtUSD(r.usd_value) +
+          '</span><span class="meta">' +
+          '<span class="' + outcomeClass + '">' + r.outcome + "</span> · " +
+          '<span class="wallet">' + shortWallet(r.wallet) + "</span>" +
+          (r.wallet_name ? " (" + r.wallet_name + ")" : "") +
           "</span></div></div>"
         );
       })
-      .join("") || '<div style="color:#5C6773; text-align:center; padding:40px 0;">No markets match this filter.</div>';
+      .join("") || '<div style="color:#5C6773; text-align:center; padding:40px 0;">No positions match this filter.</div>';
 }
 
 async function load() {
   const statusEl = document.getElementById("status");
   try {
-    const since = new Date();
-    since.setDate(since.getDate() - 14);
-    const sinceStr = since.toISOString().slice(0, 10);
     const url =
       SUPABASE_URL +
-      "/rest/v1/pm_sports_snapshots?select=*&snapshot_date=gte." +
-      sinceStr +
-      "&order=snapshot_date.desc,volume_24hr.desc";
+      "/rest/v1/pm_sports_top_bets?select=*&order=snapshot_date.desc,usd_value.desc&limit=500";
     const res = await fetch(url, {
       headers: { apikey: SUPABASE_ANON_KEY, Authorization: "Bearer " + SUPABASE_ANON_KEY },
     });
@@ -131,16 +125,8 @@ async function load() {
     const data = await res.json();
     if (!Array.isArray(data) || data.length === 0) throw new Error("No data yet — check the GitHub Action has run.");
 
-    const byDate = {};
-    data.forEach((r) => {
-      (byDate[r.snapshot_date] = byDate[r.snapshot_date] || []).push(r);
-    });
-    const dates = Object.keys(byDate).sort().reverse();
-    const currentDate = dates[0];
-    prevDate = dates[1] || null;
-    currentRows = byDate[currentDate].sort((a, b) => b.volume_24hr - a.volume_24hr);
-    prevMap = {};
-    if (prevDate) byDate[prevDate].forEach((r) => (prevMap[r.slug] = r));
+    const latestDate = data[0].snapshot_date;
+    allBets = data.filter((r) => r.snapshot_date === latestDate);
 
     render();
   } catch (e) {
