@@ -1,6 +1,7 @@
 // Finds the biggest currently-open wallet positions ("bets") on Polymarket sports markets.
 // For each active sports market, pulls the top holders per outcome token, converts their
-// share balance to a live USD value, and stores today's top positions in Supabase.
+// share balance to a live USD value, looks up the price they entered at, and stores the
+// top 1000 open positions in Supabase.
 // Requires env vars: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -12,12 +13,18 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 }
 
 const GAMMA_EVENTS =
-  "https://gamma-api.polymarket.com/events?active=true&closed=false&order=volume24hr&ascending=false&limit=300";
+  "https://gamma-api.polymarket.com/events?active=true&closed=false&order=volume24hr&ascending=false&limit=400";
 const DATA_API_HOLDERS = "https://data-api.polymarket.com/holders";
+const DATA_API_POSITIONS = "https://data-api.polymarket.com/positions";
 
 // How many of the highest-volume sports markets to scan for large positions.
-// Bounded to keep the daily run fast and within Polymarket's rate limits.
-const MARKETS_TO_SCAN = 150;
+const MARKETS_TO_SCAN = 300;
+// How many of the biggest positions to keep, PER SPORT (not globally) — so a high-volume
+// sport like NBA doesn't crowd out smaller ones like tennis or MMA.
+const TOP_N_PER_SPORT = 1000;
+// Looking up entry price costs one extra API call per bet. Capped per sport to keep the
+// daily run from taking hours — bets beyond this rank still show up, just without odds.
+const ENTRY_PRICE_LOOKUP_CAP_PER_SPORT = 150;
 
 const SPORT_KEYWORDS = [
   { match: /nba/i, label: "NBA" },
@@ -54,6 +61,12 @@ function detectSport(event) {
   return null;
 }
 
+// Excludes "who wins the World Cup" style futures/outcome markets, while still keeping
+// individual match bets (e.g. "France vs Spain") that happen to be part of a World Cup event.
+function isWorldCupWinnerMarket(marketTitle) {
+  return /world cup/i.test(marketTitle) && /winner|champion|win the/i.test(marketTitle);
+}
+
 function safeParseArray(value) {
   if (Array.isArray(value)) return value;
   if (typeof value !== "string") return [];
@@ -78,6 +91,20 @@ async function getHoldersForMarket(conditionId) {
   }
   const data = await res.json();
   return Array.isArray(data) ? data : [];
+}
+
+async function getEntryPrice(wallet, conditionId, tokenId) {
+  const url = `${DATA_API_POSITIONS}?user=${wallet}&market=${conditionId}`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!Array.isArray(data)) return null;
+    const match = data.find((p) => p.asset === tokenId) || data[0];
+    return match && typeof match.avgPrice === "number" ? match.avgPrice : null;
+  } catch {
+    return null;
+  }
 }
 
 async function upsertChunk(rows) {
@@ -117,6 +144,10 @@ async function main() {
     for (const market of event.markets || []) {
       if (scanned >= MARKETS_TO_SCAN) break;
       if (!market.conditionId) continue;
+
+      const title = market.question || event.title || "";
+      if (isWorldCupWinnerMarket(title)) continue;
+
       scanned++;
 
       const tokenIds = safeParseArray(market.clobTokenIds);
@@ -146,26 +177,48 @@ async function main() {
             market_slug: market.slug || event.slug,
             wallet: holder.proxyWallet,
             outcome: outcomeLabel,
-            market_title: market.question || event.title,
+            market_title: title,
             sport,
             amount,
             price,
             usd_value: usdValue,
             wallet_name: holder.pseudonym || holder.name || null,
+            _conditionId: market.conditionId,
+            _tokenId: group.token,
           });
         }
       }
 
-      // Small delay to stay well under Data API rate limits
-      await sleep(80);
+      await sleep(60);
     }
   }
 
-  // Keep only the biggest 300 open positions for the day — that's the point of this tracker
   allBets.sort((a, b) => b.usd_value - a.usd_value);
-  const topBets = allBets.slice(0, 300);
 
-  console.log(`Scanned ${scanned} markets, found ${allBets.length} positions, keeping top ${topBets.length}.`);
+  // Group by sport, keep the top N within each sport
+  const bySport = {};
+  for (const bet of allBets) {
+    (bySport[bet.sport] = bySport[bet.sport] || []).push(bet);
+  }
+  const topBets = [];
+  for (const sport of Object.keys(bySport)) {
+    topBets.push(...bySport[sport].slice(0, TOP_N_PER_SPORT));
+  }
+
+  console.log(`Scanned ${scanned} markets, found ${allBets.length} positions across ${Object.keys(bySport).length} sports, keeping top ${TOP_N_PER_SPORT} per sport (${topBets.length} total).`);
+  console.log(`Looking up entry prices for the top ${ENTRY_PRICE_LOOKUP_CAP_PER_SPORT} per sport...`);
+
+  for (const sport of Object.keys(bySport)) {
+    const capped = bySport[sport].slice(0, ENTRY_PRICE_LOOKUP_CAP_PER_SPORT);
+    for (const bet of capped) {
+      bet.entry_price = await getEntryPrice(bet.wallet, bet._conditionId, bet._tokenId);
+      await sleep(40);
+    }
+  }
+  for (const bet of topBets) {
+    delete bet._conditionId;
+    delete bet._tokenId;
+  }
 
   const chunkSize = 200;
   for (let i = 0; i < topBets.length; i += chunkSize) {
