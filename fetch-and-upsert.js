@@ -202,7 +202,9 @@ async function main() {
   }
   const topBets = [];
   for (const sport of Object.keys(bySport)) {
-    topBets.push(...bySport[sport].slice(0, TOP_N_PER_SPORT));
+    const picked = bySport[sport].slice(0, TOP_N_PER_SPORT);
+    picked.forEach((bet) => (bet.entry_price = null));
+    topBets.push(...picked);
   }
 
   console.log(`Scanned ${scanned} markets, found ${allBets.length} positions across ${Object.keys(bySport).length} sports, keeping top ${TOP_N_PER_SPORT} per sport (${topBets.length} total).`);
