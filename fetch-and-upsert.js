@@ -1,5 +1,3 @@
-import { createClient } from "@supabase/supabase-js";
-
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -7,8 +5,6 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY env vars.");
   process.exit(1);
 }
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 const GAMMA_EVENTS =
   "https://gamma-api.polymarket.com/events?active=true&closed=false&order=volume24hr&ascending=false&limit=500";
@@ -48,6 +44,24 @@ function detectSport(event) {
   return null;
 }
 
+async function upsertChunk(rows) {
+  const url = `${SUPABASE_URL}/rest/v1/pm_sports_snapshots?on_conflict=snapshot_date,slug`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      Prefer: "resolution=merge-duplicates,return=minimal",
+    },
+    body: JSON.stringify(rows),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Supabase upsert failed (${res.status}): ${text}`);
+  }
+}
+
 async function main() {
   console.log("Fetching Polymarket events...");
   const res = await fetch(GAMMA_EVENTS);
@@ -80,14 +94,7 @@ async function main() {
 
   const chunkSize = 200;
   for (let i = 0; i < rows.length; i += chunkSize) {
-    const chunk = rows.slice(i, i + chunkSize);
-    const { error } = await supabase
-      .from("pm_sports_snapshots")
-      .upsert(chunk, { onConflict: "snapshot_date,slug" });
-    if (error) {
-      console.error("Upsert error:", error);
-      process.exit(1);
-    }
+    await upsertChunk(rows.slice(i, i + chunkSize));
   }
 
   console.log("Done.");
