@@ -1,3 +1,8 @@
+// Finds the biggest currently-open wallet positions ("bets") on Polymarket sports markets.
+// For each active sports market, pulls the top holders per outcome token, converts their
+// share balance to a live USD value, and stores today's top positions in Supabase.
+// Requires env vars: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -7,7 +12,12 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 }
 
 const GAMMA_EVENTS =
-  "https://gamma-api.polymarket.com/events?active=true&closed=false&order=volume24hr&ascending=false&limit=500";
+  "https://gamma-api.polymarket.com/events?active=true&closed=false&order=volume24hr&ascending=false&limit=300";
+const DATA_API_HOLDERS = "https://data-api.polymarket.com/holders";
+
+// How many of the highest-volume sports markets to scan for large positions.
+// Bounded to keep the daily run fast and within Polymarket's rate limits.
+const MARKETS_TO_SCAN = 150;
 
 const SPORT_KEYWORDS = [
   { match: /nba/i, label: "NBA" },
@@ -44,8 +54,34 @@ function detectSport(event) {
   return null;
 }
 
+function safeParseArray(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== "string") return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function getHoldersForMarket(conditionId) {
+  const url = `${DATA_API_HOLDERS}?market=${conditionId}&limit=20`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    console.warn(`  holders lookup failed for ${conditionId}: ${res.status}`);
+    return [];
+  }
+  const data = await res.json();
+  return Array.isArray(data) ? data : [];
+}
+
 async function upsertChunk(rows) {
-  const url = `${SUPABASE_URL}/rest/v1/pm_sports_snapshots?on_conflict=snapshot_date,slug`;
+  const url = `${SUPABASE_URL}/rest/v1/pm_sports_top_bets?on_conflict=snapshot_date,market_slug,wallet,outcome`;
   const res = await fetch(url, {
     method: "POST",
     headers: {
@@ -63,38 +99,77 @@ async function upsertChunk(rows) {
 }
 
 async function main() {
-  console.log("Fetching Polymarket events...");
+  console.log("Fetching Polymarket sports events...");
   const res = await fetch(GAMMA_EVENTS);
   if (!res.ok) throw new Error(`Polymarket API returned ${res.status}`);
-  const data = await res.json();
-  if (!Array.isArray(data)) throw new Error("Unexpected response shape from Polymarket API");
+  const events = await res.json();
+  if (!Array.isArray(events)) throw new Error("Unexpected response shape from Polymarket API");
 
   const today = new Date().toISOString().slice(0, 10);
+  const allBets = [];
 
-  const rows = data
-    .map((e) => {
-      const sport = detectSport(e);
-      if (!sport) return null;
-      const volume24hr = parseFloat(e.volume24hr || 0);
-      const volumeTotal = parseFloat(e.volume || 0);
-      if (volume24hr <= 0) return null;
-      return {
-        snapshot_date: today,
-        slug: e.slug,
-        title: e.title,
-        sport,
-        volume_24hr: volume24hr,
-        volume_total: volumeTotal,
-        end_date: e.endDate || null,
-      };
-    })
-    .filter(Boolean);
+  let scanned = 0;
+  for (const event of events) {
+    const sport = detectSport(event);
+    if (!sport) continue;
+    if (scanned >= MARKETS_TO_SCAN) break;
 
-  console.log(`Found ${rows.length} sports events with volume. Upserting into Supabase for ${today}...`);
+    for (const market of event.markets || []) {
+      if (scanned >= MARKETS_TO_SCAN) break;
+      if (!market.conditionId) continue;
+      scanned++;
+
+      const tokenIds = safeParseArray(market.clobTokenIds);
+      const prices = safeParseArray(market.outcomePrices).map((p) => parseFloat(p));
+      const outcomes = safeParseArray(market.outcomes);
+      if (tokenIds.length === 0) continue;
+
+      let holderGroups;
+      try {
+        holderGroups = await getHoldersForMarket(market.conditionId);
+      } catch (e) {
+        console.warn(`  error fetching holders for ${market.slug}: ${e.message}`);
+        continue;
+      }
+
+      for (const group of holderGroups) {
+        const tokenIndex = tokenIds.indexOf(group.token);
+        const price = tokenIndex >= 0 ? prices[tokenIndex] || 0 : 0;
+        const outcomeLabel = tokenIndex >= 0 ? outcomes[tokenIndex] || "?" : "?";
+
+        for (const holder of group.holders || []) {
+          const amount = parseFloat(holder.amount || 0);
+          const usdValue = amount * price;
+          if (usdValue <= 0) continue;
+          allBets.push({
+            snapshot_date: today,
+            market_slug: market.slug || event.slug,
+            wallet: holder.proxyWallet,
+            outcome: outcomeLabel,
+            market_title: market.question || event.title,
+            sport,
+            amount,
+            price,
+            usd_value: usdValue,
+            wallet_name: holder.pseudonym || holder.name || null,
+          });
+        }
+      }
+
+      // Small delay to stay well under Data API rate limits
+      await sleep(80);
+    }
+  }
+
+  // Keep only the biggest 300 open positions for the day — that's the point of this tracker
+  allBets.sort((a, b) => b.usd_value - a.usd_value);
+  const topBets = allBets.slice(0, 300);
+
+  console.log(`Scanned ${scanned} markets, found ${allBets.length} positions, keeping top ${topBets.length}.`);
 
   const chunkSize = 200;
-  for (let i = 0; i < rows.length; i += chunkSize) {
-    await upsertChunk(rows.slice(i, i + chunkSize));
+  for (let i = 0; i < topBets.length; i += chunkSize) {
+    await upsertChunk(topBets.slice(i, i + chunkSize));
   }
 
   console.log("Done.");
