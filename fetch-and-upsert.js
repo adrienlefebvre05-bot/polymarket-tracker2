@@ -67,6 +67,20 @@ function isWorldCupWinnerMarket(marketTitle) {
   return /world cup/i.test(marketTitle) && /winner|champion|win the/i.test(marketTitle);
 }
 
+// Wallets to always exclude from results. Since displayed addresses are shortened
+// (e.g. "0xa5ef…2966"), matching is done by prefix + suffix rather than full address.
+const EXCLUDED_WALLETS = [
+  { prefix: "0xa5ef", suffix: "2966" },
+];
+
+function isExcludedWallet(address) {
+  if (!address) return false;
+  const lower = address.toLowerCase();
+  return EXCLUDED_WALLETS.some(
+    ({ prefix, suffix }) => lower.startsWith(prefix.toLowerCase()) && lower.endsWith(suffix.toLowerCase())
+  );
+}
+
 function safeParseArray(value) {
   if (Array.isArray(value)) return value;
   if (typeof value !== "string") return [];
@@ -169,6 +183,7 @@ async function main() {
         const outcomeLabel = tokenIndex >= 0 ? outcomes[tokenIndex] || "?" : "?";
 
         for (const holder of group.holders || []) {
+          if (isExcludedWallet(holder.proxyWallet)) continue;
           const amount = parseFloat(holder.amount || 0);
           const usdValue = amount * price;
           if (usdValue <= 0) continue;
